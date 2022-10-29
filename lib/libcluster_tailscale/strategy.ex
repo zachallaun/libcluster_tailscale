@@ -142,7 +142,7 @@ defmodule ClusterTailscale.Strategy do
 
   defp fetch_default_basename(%{topology: t}) do
     if Node.alive?() do
-      {basename, _host} = Node.self() |> to_string() |> String.split("@")
+      [basename, _host] = Node.self() |> to_string() |> String.split("@")
       {:ok, basename}
     else
       error(t, "current node must be alive to use default :node_basename")
