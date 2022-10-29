@@ -82,16 +82,10 @@ defmodule ClusterTailscale.Strategy do
   defp get_nodes(state, {:ok, hostname}, {:ok, basename}, {:ok, cli}) do
     with {result, 0} <- System.shell("#{cli} status --json"),
          {:ok, %{"Peer" => peers}} <- Jason.decode(result) do
-      peers
-      |> Map.values()
-      |> Enum.filter(&(&1["Online"] == true && &1["HostName"] == hostname))
-      |> Enum.map(&peer_ip/1)
-      |> Task.async_stream(&ts_ping(&1, cli))
-      |> Enum.flat_map(fn
-        {:ok, {:ok, ip}} -> [:"#{basename}@#{ip}"]
-        _ -> []
-      end)
-      |> MapSet.new()
+      for {_, %{"Online" => true, "HostName" => ^hostname} = peer} <- peers,
+          into: MapSet.new() do
+        :"#{basename}@#{peer_ip(peer)}"
+      end
     else
       _ ->
         error(state.topology, "unable to fetch peers with Tailscale CLI")
@@ -100,13 +94,6 @@ defmodule ClusterTailscale.Strategy do
   end
 
   defp get_nodes(_, _, _, _), do: MapSet.new()
-
-  defp ts_ping(ip, cli) do
-    case System.shell("#{cli} ping --timeout .5s #{ip}") do
-      {_, 0} -> {:ok, ip}
-      _ -> :error
-    end
-  end
 
   defp peer_ip(%{"TailscaleIPs" => [ipv4, ipv6]}) do
     case :init.get_argument(:proto_dist) do
