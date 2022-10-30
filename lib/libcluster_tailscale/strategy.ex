@@ -68,7 +68,7 @@ defmodule ClusterTailscale.Strategy do
     dbg(known_peers)
     dbg(prev_known_peers)
     dbg(connected)
-    all_nodes = known_peers |> Map.values() |> MapSet.new()
+    all_nodes = known_peers |> Map.keys() |> MapSet.new()
 
     to_connect =
       all_nodes
