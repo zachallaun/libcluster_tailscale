@@ -65,6 +65,9 @@ defmodule ClusterTailscale.Strategy do
   end
 
   defp resolve_peers(known_peers, prev_known_peers, connected) do
+    dbg(known_peers)
+    dbg(prev_known_peers)
+    dbg(connected)
     all_nodes = known_peers |> Map.values() |> MapSet.new()
 
     to_connect =
@@ -91,8 +94,8 @@ defmodule ClusterTailscale.Strategy do
     with {result, 0} <- System.shell("#{cli} status --json"),
          {:ok, %{"Peer" => peers}} <- Jason.decode(result) do
       for {_, %{"Online" => true, "HostName" => ^hostname} = peer} <- peers, into: %{} do
-        peer = parse_peer(peer, basename)
-        {peer.node, peer}
+        parsed = parse_peer(peer, basename)
+        {parsed.node, parsed}
       end
     else
       _ ->
