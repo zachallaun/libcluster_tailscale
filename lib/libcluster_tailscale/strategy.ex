@@ -81,7 +81,10 @@ defmodule ClusterTailscale.Strategy do
           ) == :gt
       end)
 
-    to_disconnect = MapSet.difference(connected, all_nodes)
+    to_disconnect =
+      connected
+      |> MapSet.difference(all_nodes)
+      |> MapSet.delete(Node.self())
 
     {known_peers, to_connect, to_disconnect}
   end
@@ -137,7 +140,7 @@ defmodule ClusterTailscale.Strategy do
   end
 
   defp list_nodes(%{list_nodes: {m, f, a}}) do
-    apply(m, f, a) |> MapSet.new() |> MapSet.put(Node.self())
+    apply(m, f, a) |> MapSet.new()
   end
 
   defp connect(%{connect: {m, f, a}} = state, node) do
