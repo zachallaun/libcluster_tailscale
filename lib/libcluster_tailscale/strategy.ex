@@ -18,21 +18,23 @@ defmodule ClusterTailscale.Strategy do
   """
 
   use GenServer
-  import Cluster.Logger
 
   alias Cluster.Strategy.State
-  alias Cluster.Strategy
+  alias Cluster.Logger
 
   @default_polling_interval 5_000
+  @not_seen ~U[0001-01-01 00:00:00Z]
 
-  def start_link(args), do: GenServer.start_link(__MODULE__, args)
+  def start_link([state]), do: GenServer.start_link(__MODULE__, state)
 
   @impl true
-  def init([%State{meta: nil} = state]) do
-    init([%{state | meta: MapSet.new()}])
+  def init(%State{meta: nil} = state) do
+    state
+    |> Map.put(:meta, %{})
+    |> init()
   end
 
-  def init([%State{} = state]) do
+  def init(%State{} = state) do
     {:ok, poll(state)}
   end
 
@@ -41,64 +43,114 @@ defmodule ClusterTailscale.Strategy do
   def handle_info(:poll, state), do: {:noreply, poll(state)}
   def handle_info(_, state), do: {:noreply, state}
 
-  defp poll(%State{} = state) do
-    nodeset =
-      get_nodes(state)
-      |> disconnect_nodes(state)
-      |> connect_nodes(state)
+  defp poll(%{meta: known_peers} = state) do
+    connected = list_nodes(state)
+
+    {known_peers, to_connect, to_disconnect} =
+      state
+      |> get_online_peers()
+      |> resolve_peers(known_peers, connected)
+
+    for node <- to_connect do
+      connect(state, node)
+    end
+
+    for node <- to_disconnect do
+      disconnect(state, node)
+    end
 
     schedule_next_poll(state)
 
-    %{state | meta: nodeset}
+    %{state | meta: known_peers}
   end
 
-  defp disconnect_nodes(nodeset, %{meta: old_nodeset} = state) do
-    %{disconnect: disconnect, topology: t, list_nodes: list_nodes} = state
-    removed = MapSet.difference(old_nodeset, nodeset)
+  defp resolve_peers(known_peers, prev_known_peers, connected) do
+    all_nodes = known_peers |> Map.values() |> MapSet.new()
 
-    case Strategy.disconnect_nodes(t, disconnect, list_nodes, MapSet.to_list(removed)) do
-      :ok -> nodeset
-      {:error, not_disconnected} -> MapSet.union(nodeset, MapSet.new(not_disconnected))
-    end
+    to_connect =
+      all_nodes
+      |> MapSet.difference(connected)
+      |> Enum.filter(fn n ->
+        n not in connected &&
+          DateTime.compare(
+            get_in(known_peers, [n, :last_seen]),
+            get_in(prev_known_peers, [n, :last_seen]) || @not_seen
+          ) == :gt
+      end)
+
+    to_disconnect = MapSet.difference(connected, all_nodes)
+
+    {known_peers, to_connect, to_disconnect}
   end
 
-  defp connect_nodes(nodeset, state) do
-    %{connect: connect, topology: t, list_nodes: list_nodes} = state
-
-    case Strategy.connect_nodes(t, connect, list_nodes, MapSet.to_list(nodeset)) do
-      :ok -> nodeset
-      {:error, not_connected} -> MapSet.difference(nodeset, MapSet.new(not_connected))
-    end
+  defp get_online_peers(state) do
+    get_online_peers(state, fetch_hostname(state), fetch_basename(state), fetch_cli(state))
   end
 
-  defp schedule_next_poll(state) do
-    Process.send_after(self(), :poll, polling_interval(state))
-  end
-
-  defp get_nodes(state) do
-    get_nodes(state, fetch_hostname(state), fetch_basename(state), fetch_cli(state))
-  end
-
-  defp get_nodes(state, {:ok, hostname}, {:ok, basename}, {:ok, cli}) do
+  defp get_online_peers(state, {:ok, hostname}, {:ok, basename}, {:ok, cli}) do
     with {result, 0} <- System.shell("#{cli} status --json"),
          {:ok, %{"Peer" => peers}} <- Jason.decode(result) do
-      for {_, %{"Online" => true, "HostName" => ^hostname} = peer} <- peers,
-          into: MapSet.new() do
-        :"#{basename}@#{peer_ip(peer)}"
+      for {_, %{"Online" => true, "HostName" => ^hostname} = peer} <- peers, into: %{} do
+        peer = parse_peer(peer, basename)
+        {peer.node, peer}
       end
     else
       _ ->
         error(state.topology, "unable to fetch peers with Tailscale CLI")
-        MapSet.new()
+        %{}
     end
   end
 
-  defp get_nodes(_, _, _, _), do: MapSet.new()
+  defp get_online_peers(_, _, _, _), do: MapSet.new()
+
+  defp parse_peer(peer, basename) do
+    ip = peer_ip(peer)
+
+    %{
+      ip: ip,
+      node: :"#{basename}@#{ip}",
+      last_seen: peer_last_seen(peer)
+    }
+  end
 
   defp peer_ip(%{"TailscaleIPs" => [ipv4, ipv6]}) do
     case :init.get_argument(:proto_dist) do
       {:ok, [['inet6_tcp']]} -> ipv6
       _ -> ipv4
+    end
+  end
+
+  defp peer_last_seen(%{"LastSeen" => iso8601}) when is_binary(iso8601) and iso8601 != "" do
+    case DateTime.from_iso8601(iso8601) do
+      {:ok, last_seen, 0} -> last_seen
+      _ -> @not_seen
+    end
+  end
+
+  defp peer_last_seen(_), do: @not_seen
+
+  defp schedule_next_poll(state) do
+    Process.send_after(self(), :poll, polling_interval(state))
+  end
+
+  defp list_nodes(%{list_nodes: {m, f, a}}) do
+    apply(m, f, a) |> MapSet.new() |> MapSet.put(Node.self())
+  end
+
+  defp connect(%{connect: {m, f, a}} = state, node) do
+    case apply(m, f, a ++ [node]) do
+      true -> info(state, "connected to #{inspect(node)}")
+      false -> warn(state, "unable to connect to #{inspect(node)}")
+      :ignored -> warn(state, "unable to connect to #{inspect(node)}; not part of network")
+    end
+  end
+
+  defp disconnect(%{disconnect: {m, f, a}} = state, node) do
+    case apply(m, f, a ++ [node]) do
+      true -> info(state, "disconnected from #{inspect(node)}")
+      false -> warn(state, "unable to disconnect from #{inspect(node)}")
+      :ignored -> warn(state, "unable to disconnect from #{inspect(node)}; not part of network")
+      reason -> warn(state, "disconnect from #{inspect(node)} failed with: #{inspect(reason)}")
     end
   end
 
@@ -163,4 +215,10 @@ defmodule ClusterTailscale.Strategy do
   defp invalid_config(topology, key, invalid) do
     error(topology, "invalid #{inspect(key)} for ClusterTailscale.Strategy: #{inspect(invalid)}")
   end
+
+  ## Logging
+
+  defp info(%{topology: t}, msg), do: Logger.info(t, msg)
+  defp warn(%{topology: t}, msg), do: Logger.warn(t, msg)
+  defp error(%{topology: t}, msg), do: Logger.error(t, msg)
 end
