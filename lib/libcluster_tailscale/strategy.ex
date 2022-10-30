@@ -65,9 +65,6 @@ defmodule ClusterTailscale.Strategy do
   end
 
   defp resolve_peers(known_peers, prev_known_peers, connected) do
-    dbg(known_peers)
-    dbg(prev_known_peers)
-    dbg(connected)
     all_nodes = known_peers |> Map.keys() |> MapSet.new()
 
     to_connect =
